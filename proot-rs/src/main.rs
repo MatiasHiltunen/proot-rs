@@ -19,6 +19,8 @@ mod kernel;
 mod process;
 mod register;
 mod utils;
+mod android_compat;
+mod android_log;
 
 use crate::errors::Result;
 use crate::process::proot::{show_info, stop_program, PRoot};

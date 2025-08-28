@@ -173,6 +173,39 @@ impl PRoot {
                             unreachable!();
                         }
                     }
+                    // Optional: detect shebang on the intended guest target to aid diagnostics
+                    // on Android. This does not change behavior, only logs a hint.
+                    {
+                        use std::io::Read;
+                        let arg0_bytes = args[0].as_bytes();
+                        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+                        if arg0_bytes.contains(&b'/') {
+                            let guest_os = std::ffi::OsStr::from_bytes(arg0_bytes);
+                            let guest_path = std::path::Path::new(guest_os);
+                            if guest_path.is_absolute() {
+                                let mut host_path = initial_fs.get_root().to_path_buf();
+                                if let Ok(stripped) = guest_path.strip_prefix("/") {
+                                    host_path.push(stripped);
+                                }
+                                candidates.push(host_path);
+                            }
+                        } else {
+                            let name = std::ffi::OsStr::from_bytes(arg0_bytes);
+                            candidates.push(initial_fs.get_root().join("bin").join(name));
+                            candidates.push(initial_fs.get_root().join("usr/bin").join(name));
+                        }
+                        for c in candidates.into_iter() {
+                            if c.exists() {
+                                if let Ok(mut f) = std::fs::File::open(&c) {
+                                    let mut magic = [0u8; 2];
+                                    if f.read(&mut magic).ok() == Some(2) && magic == *b"#!" {
+                                        debug!("android-compat: shebang detected in {:?}", c);
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
                     // Trampoline strategy: Always exec a safe host shell first, passing a tiny
                     // script that re-execs the intended command. This ensures the first exec
                     // succeeds on Android/Termux and our ptrace translation can take over on the
@@ -349,13 +382,24 @@ impl PRoot {
                             tracee.regs.fetch_regs()?;
                             let sys = tracee.regs.get_sys_num(Current);
                             match sys {
+                                // epoll_create(size) -> epoll_create1(flags=0)
+                                #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "arm"))]
+                                x if x == sc::nr::EPOLL_CREATE => {
+                                    debug!("android-compat: remap epoll_create -> epoll_create1");
+                                    crate::android_log::log_remap(sc::nr::EPOLL_CREATE, sc::nr::EPOLL_CREATE1, "epoll_create->epoll_create1", tracee.pid.as_raw());
+                                    tracee.regs.set_sys_num(sc::nr::EPOLL_CREATE1, "android-compat: epoll_create->epoll_create1");
+                                    tracee.regs.set(SysArg(SysArg1), 0, "flags=0");
+                                }
                                 // accept -> accept4(..., 0)
                                 x if x == sc::nr::ACCEPT => {
+                                    debug!("android-compat: remap accept -> accept4");
+                                    crate::android_log::log_remap(sc::nr::ACCEPT, sc::nr::ACCEPT4, "accept->accept4", tracee.pid.as_raw());
                                     tracee.regs.set_sys_num(sc::nr::ACCEPT4, "android-compat: accept->accept4");
                                     tracee.regs.set(SysArg(SysArg4), 0, "set flags=0");
                                 }
                                 // statfs(path, buf) -> emulate in tracer using host statfs
                                 x if x == sc::nr::STATFS => {
+                                    debug!("android-compat: emulate statfs in tracer");
                                     // Save regs to allow controlled push without restore
                                     tracee.regs.save_current_regs(crate::register::Original);
                                     let guest_path = tracee.regs.get_sysarg_path(SysArg1)?;
@@ -380,6 +424,8 @@ impl PRoot {
                                             )
                                         };
                                         tracee.regs.write_data(dest, bytes, false)?;
+                                        // Log emulation success for test visibility
+                                        crate::android_log::log_remap(sc::nr::STATFS, sc::nr::STATFS, "statfs emulated", tracee.pid.as_raw());
                                         // Cancel syscall and set result 0
                                         tracee.regs.cancel_syscall("android-compat: emulate statfs");
                                         tracee.regs.set(crate::register::SysResult, 0, "statfs ok");
@@ -403,6 +449,8 @@ impl PRoot {
                                 // utimes(path, timeval[2]) -> utimensat(AT_FDCWD, path, timespec[2], 0)
                                 #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "arm"))]
                                 x if x == sc::nr::UTIMES => {
+                                    debug!("android-compat: remap utimes -> utimensat");
+                                    crate::android_log::log_remap(sc::nr::UTIMES, sc::nr::UTIMENSAT, "utimes->utimensat", tracee.pid.as_raw());
                                     use std::mem::size_of;
                                     let tv_ptr = tracee.regs.get(Current, SysArg(SysArg2)) as *mut libc::c_void;
                                     if tv_ptr.is_null() {
@@ -435,9 +483,45 @@ impl PRoot {
                                         tracee.regs.set(SysArg(SysArg1), libc::AT_FDCWD as _, "AT_FDCWD");
                                     }
                                 }
+                                // utime(path, utimbuf*) -> utimensat(AT_FDCWD, path, timespec[2], 0)
+                                #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "arm"))]
+                                x if x == sc::nr::UTIME => {
+                                    debug!("android-compat: remap utime -> utimensat");
+                                    crate::android_log::log_remap(sc::nr::UTIME, sc::nr::UTIMENSAT, "utime->utimensat", tracee.pid.as_raw());
+                                    use std::mem::size_of;
+                                    let ub_ptr = tracee.regs.get(Current, SysArg(SysArg2)) as *mut libc::c_void;
+                                    if ub_ptr.is_null() {
+                                        tracee.regs.set_sys_num(sc::nr::UTIMENSAT, "android-compat: utime->utimensat");
+                                        tracee.regs.set(SysArg(SysArg4), 0, "flags=0");
+                                        tracee.regs.set(SysArg(SysArg3), 0, "timespec=NULL");
+                                        tracee.regs.set(SysArg(SysArg1), libc::AT_FDCWD as _, "AT_FDCWD");
+                                    } else {
+                                        let mut buf = vec![0u8; size_of::<libc::utimbuf>()];
+                                        let word_size = size_of::<crate::register::Word>();
+                                        let nb_words = (buf.len() + word_size - 1) / word_size;
+                                        for i in 0..nb_words {
+                                            let src = unsafe { (ub_ptr as *mut crate::register::Word).offset(i as isize) } as *mut libc::c_void;
+                                            let w = nix::sys::ptrace::read(tracee.regs.get_pid(), src)? as crate::register::Word;
+                                            let bytes = crate::register::reader::convert_word_to_bytes(w);
+                                            let start = i * word_size;
+                                            let end = std::cmp::min(start + word_size, buf.len());
+                                            buf[start..end].copy_from_slice(&bytes[..end - start]);
+                                        }
+                                        let ut: libc::utimbuf = unsafe { std::ptr::read(buf.as_ptr() as *const libc::utimbuf) };
+                                        let ts = crate::android_compat::utimbuf_to_timespec2(ut);
+                                        let ts_bytes = unsafe { std::slice::from_raw_parts((&ts as *const libc::timespec) as *const u8, 2 * size_of::<libc::timespec>()) };
+                                        let ts_ptr = tracee.regs.allocate_and_write(ts_bytes, false)?;
+                                        tracee.regs.set_sys_num(sc::nr::UTIMENSAT, "android-compat: utime->utimensat");
+                                        tracee.regs.set(SysArg(SysArg4), 0, "flags=0");
+                                        tracee.regs.set(SysArg(SysArg3), ts_ptr as u64, "timespec*");
+                                        tracee.regs.set(SysArg(SysArg1), libc::AT_FDCWD as _, "AT_FDCWD");
+                                    }
+                                }
                                 // select -> pselect6 (convert timeval to timespec)
                                 #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "arm"))]
                                 x if x == sc::nr::SELECT => {
+                                    debug!("android-compat: remap select -> pselect6");
+                                    crate::android_log::log_remap(sc::nr::SELECT, sc::nr::PSELECT6, "select->pselect6", tracee.pid.as_raw());
                                     use std::mem::size_of;
                                     let tv_ptr = tracee.regs.get(Current, SysArg(SysArg5)) as *mut libc::c_void;
                                     let ts_ptr = if tv_ptr.is_null() { 0 } else {
@@ -464,6 +548,8 @@ impl PRoot {
                                 // poll -> ppoll (convert timeout ms to timespec)
                                 #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "arm"))]
                                 x if x == sc::nr::POLL => {
+                                    debug!("android-compat: remap poll -> ppoll");
+                                    crate::android_log::log_remap(sc::nr::POLL, sc::nr::PPOLL, "poll->ppoll", tracee.pid.as_raw());
                                     let timeout_ms = tracee.regs.get(Current, SysArg(SysArg3)) as i64;
                                     if timeout_ms < 0 {
                                         tracee.regs.set(SysArg(SysArg3), 0, "timespec=NULL");
@@ -480,6 +566,8 @@ impl PRoot {
                                 // epoll_wait -> epoll_pwait
                                 #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "arm"))]
                                 x if x == sc::nr::EPOLL_WAIT => {
+                                    debug!("android-compat: remap epoll_wait -> epoll_pwait");
+                                    crate::android_log::log_remap(sc::nr::EPOLL_WAIT, sc::nr::EPOLL_PWAIT, "epoll_wait->epoll_pwait", tracee.pid.as_raw());
                                     tracee.regs.set_sys_num(sc::nr::EPOLL_PWAIT, "android-compat: epoll_wait->epoll_pwait");
                                     tracee.regs.set(SysArg(SysArg5), 0, "sigmask=NULL");
                                     tracee.regs.set(SysArg(SysArg6), 0, "sigsetsize=0");
