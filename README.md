@@ -159,6 +159,32 @@ Build and run release version of `proot-rs`:
 cargo make run --profile=production -- "<args-of-proot-rs>"
 ```
 
+## Termux/Android Support
+
+This fork adds first-pass Termux/Android (aarch64) support on stable Rust:
+
+- Replaces the nightly-only `japaric/syscall.rs` with a minimal stable shim at `sc/` exposing
+  just the syscall numbers needed, sourced from `libc`. On Android, certain legacy syscalls are
+  not exported by bionic; we map those to a non-matching sentinel so code compiles and simply
+  treats them as unknown at runtime.
+- Disables the heavy syscall-name mapping on Android to avoid depending on unavailable numbers;
+  logs fall back to numeric identifiers.
+- Uses `clang` as the linker for `aarch64-linux-android` in `.cargo/config.toml`, matching Termux
+  environments that do not ship NDK wrapper binaries.
+- Embeds a small placeholder `loader-shim` at `proot-rs/src/kernel/execve/loader-shim` so builds and
+  basic unit tests succeed without a nightly-only loader build. Replace it with a real binary if
+  you need traced exec.
+- You can override the embedded loader at runtime via `PROOT_LOADER_SHIM=/path/to/loader-shim`.
+- Skips ptrace-heavy tests on Android (`#[cfg(all(test, not(target_os = "android")))]`).
+- Adds an Android compatibility behavior to swallow `SIGSYS` delivered by seccomp so the tracee
+  isn’t killed; enable/disable via `PROOT_ANDROID_COMPAT` (default: enabled on Android). This is a
+  pragmatic survival mode; full emulation policies may be expanded over time.
+ - CLI flags: `--android-compat` and `--no-android-compat` to toggle the behavior explicitly.
+
+Notes:
+- Running end-to-end on Android typically requires ptrace to be permitted for the app; many devices
+  restrict this. Expect limited runtime functionality unless the environment allows tracing.
+
 ## Tests
 
 ### Setup new rootfs for testing
@@ -203,4 +229,3 @@ To format code manually:
 ```shell
 cargo fmt
 ```
-

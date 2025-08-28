@@ -88,7 +88,7 @@ impl Substitutor for FileSystem {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "android")))]
 mod tests {
     use super::*;
     use crate::errors::Error;

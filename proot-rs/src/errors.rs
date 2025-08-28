@@ -1,4 +1,5 @@
 pub use nix::errno::Errno::{self, *};
+use std::any::Any;
 use std::io::Error as IOError;
 use std::{
     fmt::{self, Display},
@@ -111,33 +112,35 @@ impl PartialEq for Error {
     }
 }
 
-impl From<Errno> for Error {
-    fn from(errno: Errno) -> Error {
-        Error::errno(errno)
-    }
-}
+// Note: We rely on the generic `From<E>` below for converting `nix::errno::Errno`
+// which implements `std::error::Error`.
 
+
+// Generic conversion from any error type. On stable Rust we cannot use
+// specialization, so we perform a best-effort downcast to `std::io::Error`
+// to recover an errno when possible, and fall back to `UnknownErrno`.
 impl<E> From<E> for Error
 where
-    E: std::error::Error + 'static,
+    E: std::error::Error + Send + Sync + 'static,
 {
-    default fn from(error: E) -> Self {
-        Error {
-            errno: UnknownErrno,
-            msg: None,
-            source: Some(Box::new(error)),
-        }
-    }
-}
+    fn from(error: E) -> Self {
+        // Try to extract a meaningful errno when the incoming error is
+        // actually an `std::io::Error`.
+        let errno = {
+            // Cast to `&dyn Any` to attempt a downcast.
+            let any_ref = &error as &dyn Any;
+            if let Some(ioe) = any_ref.downcast_ref::<IOError>() {
+                match ioe.raw_os_error() {
+                    Some(code) => Errno::from_i32(code),
+                    None => Errno::UnknownErrno,
+                }
+            } else {
+                Errno::UnknownErrno
+            }
+        };
 
-impl From<IOError> for Error {
-    fn from(error: IOError) -> Error {
         Error {
-            errno: match error.raw_os_error() {
-                // we try to convert it to an errno
-                Some(errno) => Errno::from_i32(errno),
-                None => Errno::UnknownErrno,
-            },
+            errno,
             msg: None,
             source: Some(Box::new(error)),
         }
@@ -166,20 +169,20 @@ pub trait WithContext<T> {
 #[allow(dead_code)]
 impl<T, E> WithContext<T> for result::Result<T, E>
 where
-    Error: From<E>,
+    E: Into<Error>,
 {
-    default fn errno(self, errno: Errno) -> Result<T> {
+    fn errno(self, errno: Errno) -> Result<T> {
         self.map_err(|error| Into::<Error>::into(error).with_errno(errno))
     }
 
-    default fn context<C>(self, context: C) -> Result<T>
+    fn context<C>(self, context: C) -> Result<T>
     where
         C: Display + Send + Sync + 'static,
     {
         self.map_err(|error| Into::<Error>::into(error).with_msg(context))
     }
 
-    default fn with_context<C, F>(self, f: F) -> Result<T>
+    fn with_context<C, F>(self, f: F) -> Result<T>
     where
         C: Display + Send + Sync + 'static,
         F: FnOnce() -> C,
@@ -188,22 +191,5 @@ where
             Ok(t) => Ok(t),
             Err(e) => Err(e).context(f()),
         }
-    }
-}
-
-#[allow(dead_code)]
-impl<T> WithContext<T> for result::Result<T, Error> {
-    fn context<C>(self, context: C) -> Result<T>
-    where
-        C: Display + Send + Sync + 'static,
-    {
-        self.map_err(|error| {
-            if let Some(ref msg) = error.msg {
-                let new_msg = format!("{}: {}", context, msg);
-                error.with_msg(new_msg)
-            } else {
-                error.with_msg(context)
-            }
-        })
     }
 }

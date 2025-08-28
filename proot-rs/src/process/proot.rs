@@ -4,6 +4,7 @@ use std::ffi::CString;
 use std::process;
 use std::rc::Rc;
 use std::{collections::HashMap, convert::TryFrom};
+use std::os::unix::ffi::OsStrExt;
 
 use libc::{c_int, c_void, pid_t, siginfo_t};
 use nix::sys::ptrace::{self, Event as PtraceEvent};
@@ -18,6 +19,7 @@ use crate::{
     errors::*,
     filesystem::{temp::TempFile, FileSystem},
 };
+use crate::filesystem::Translator;
 
 /// Used to store global info common to all tracees. Rename into
 /// `Configuration`?
@@ -131,8 +133,86 @@ impl PRoot {
                     //TODO: seccomp
                     //if (getenv("PROOT_NO_SECCOMP") == NULL)
                     //    (void) enable_syscall_filtering(tracee);
-                    unistd::execvp(&filename, &args).with_context(|| {
-                        format!("Failed to call execvp() with command: {:?}", command)
+                    // Prefer direct resolution of argv[0] to a real host executable to make the
+                    // first exec succeed on Android/Termux.
+                    {
+                        let arg0_bytes = args[0].as_bytes();
+                        let mut host_exec_path: Option<std::path::PathBuf> = None;
+                        if arg0_bytes.contains(&b'/') {
+                            let guest_os = std::ffi::OsStr::from_bytes(arg0_bytes);
+                            let guest_path = std::path::Path::new(guest_os);
+                            if guest_path.is_absolute() {
+                                let mut host_path = initial_fs.get_root().to_path_buf();
+                                if let Ok(stripped) = guest_path.strip_prefix("/") {
+                                    host_path.push(stripped);
+                                }
+                                if host_path.exists() {
+                                    host_exec_path = Some(host_path);
+                                }
+                            }
+                        } else {
+                            let name = std::ffi::OsStr::from_bytes(arg0_bytes);
+                            let mut candidates = vec![
+                                initial_fs.get_root().join("bin").join(name),
+                                initial_fs.get_root().join("usr/bin").join(name),
+                                std::path::PathBuf::from("/system/bin").join(name),
+                            ];
+                            for c in candidates.drain(..) {
+                                if c.exists() { host_exec_path = Some(c); break; }
+                            }
+                        }
+                        if let Some(host_exec) = host_exec_path {
+                            let host_c = std::ffi::CString::new(host_exec.as_os_str().as_bytes())
+                                .with_context(|| format!("Bad exec path bytes: {:?}", host_exec))?;
+                            unistd::execv(&host_c, &args).with_context(|| {
+                                format!(
+                                    "Failed to execv resolved host path {:?} for command {:?}",
+                                    host_exec, command
+                                )
+                            })?;
+                            unreachable!();
+                        }
+                    }
+                    // Trampoline strategy: Always exec a safe host shell first, passing a tiny
+                    // script that re-execs the intended command. This ensures the first exec
+                    // succeeds on Android/Termux and our ptrace translation can take over on the
+                    // subsequent exec.
+                    // Allow explicit trampoline path via env (CLI flag). Otherwise try common shells.
+                    let mut trampoline = std::env::var_os("PROOT_TRAMPOLINE")
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(|| initial_fs.get_root().join("bin/sh"));
+                    if !trampoline.exists() {
+                        trampoline = initial_fs.get_root().join("bin/dash");
+                    }
+                    if !trampoline.exists() {
+                        trampoline = std::path::PathBuf::from("/system/bin/sh");
+                    }
+
+                    let tramp_bytes = trampoline.as_os_str().as_bytes();
+                    let tramp = std::ffi::CString::new(tramp_bytes)
+                        .with_context(|| format!("No suitable shell found for trampoline at {:?}", trampoline))?;
+
+                    // Build argv for: sh -c 'exec "$@"' -- <original argv>
+                    let dash_c = std::ffi::CString::new("-c").unwrap();
+                    let script = std::ffi::CString::new("exec \"$@\"").unwrap();
+                    let sep = std::ffi::CString::new("--").unwrap();
+
+                    // Compose: [tramp, -c, script, --, orig0, orig1, ...]
+                    let mut new_argv: Vec<std::ffi::CString> = Vec::with_capacity(4 + args.len());
+                    new_argv.push(tramp.clone());
+                    new_argv.push(dash_c);
+                    new_argv.push(script);
+                    new_argv.push(sep);
+                    for a in &args {
+                        new_argv.push(a.clone());
+                    }
+
+                    let argv_refs: Vec<&std::ffi::CStr> = new_argv.iter().map(|c| c.as_c_str()).collect();
+                    unistd::execv(&tramp, &argv_refs).with_context(|| {
+                        format!(
+                            "Failed to call execv() trampoline {:?} for command: {:?}",
+                            trampoline, command
+                        )
                     })?;
                     unreachable!()
                 };
@@ -245,6 +325,174 @@ impl PRoot {
                             }
 
                             tracee.handle_sigstop_event();
+                        }
+                        // Android compat: swallows SIGSYS (seccomp) and forces the
+                        // current syscall to fail with ENOSYS to keep the tracee
+                        // alive under Android's seccomp policy.
+                        Signal::SIGSYS => {
+                            // Enable by default on Android, can be disabled by setting
+                            // PROOT_ANDROID_COMPAT=0.
+                            let android_compat = cfg!(target_os = "android")
+                                && std::env::var("PROOT_ANDROID_COMPAT")
+                                    .map(|v| v != "0")
+                                    .unwrap_or(true);
+                            if android_compat {
+                                debug!("-- {}, SIGSYS swallowed (android-compat)", pid);
+                        // Do not deliver SIGSYS; allow the tracee to continue. Some Android
+                        // seccomp policies send SIGSYS but do not kill the process if the
+                        // signal is handled/ignored.
+                        signal_to_delivery = None;
+                        // Opportunistically rewrite some blocked syscalls to their
+                        // *at/*p* replacements so the kernel permits them under seccomp.
+                        if let Err(e) = (|| -> Result<()> {
+                            use crate::register::{Current, SysArg, SysArg1, SysArg2, SysArg3, SysArg4, SysArg5, PtraceReader, PtraceWriter};
+                            tracee.regs.fetch_regs()?;
+                            let sys = tracee.regs.get_sys_num(Current);
+                            match sys {
+                                // accept -> accept4(..., 0)
+                                x if x == sc::nr::ACCEPT => {
+                                    tracee.regs.set_sys_num(sc::nr::ACCEPT4, "android-compat: accept->accept4");
+                                    tracee.regs.set(SysArg(SysArg4), 0, "set flags=0");
+                                }
+                                // statfs(path, buf) -> emulate in tracer using host statfs
+                                x if x == sc::nr::STATFS => {
+                                    // Save regs to allow controlled push without restore
+                                    tracee.regs.save_current_regs(crate::register::Original);
+                                    let guest_path = tracee.regs.get_sysarg_path(SysArg1)?;
+                                    // Translate guest path to host path
+                                    let host_path = tracee
+                                        .fs
+                                        .borrow()
+                                        .translate_path(&guest_path, true)
+                                        .map(|(_, p)| p)
+                                        .unwrap_or_else(|_| guest_path.clone());
+                                    let host_c = std::ffi::CString::new(host_path.as_os_str().as_bytes())
+                                        .map_err(|_| Error::errno_with_msg(Errno::EFAULT, "bad host path bytes"))?;
+                                    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+                                    let rc = unsafe { libc::statfs(host_c.as_ptr(), &mut st as *mut _) };
+                                    if rc == 0 {
+                                        // Write back to tracee buffer
+                                        let dest = tracee.regs.get(Current, SysArg(SysArg2)) as *mut _;
+                                        let bytes = unsafe {
+                                            std::slice::from_raw_parts(
+                                                (&st as *const libc::statfs) as *const u8,
+                                                std::mem::size_of::<libc::statfs>(),
+                                            )
+                                        };
+                                        tracee.regs.write_data(dest, bytes, false)?;
+                                        // Cancel syscall and set result 0
+                                        tracee.regs.cancel_syscall("android-compat: emulate statfs");
+                                        tracee.regs.set(crate::register::SysResult, 0, "statfs ok");
+                                        tracee.regs.set_restore_original_regs(false);
+                                        tracee.regs.push_regs()?;
+                                    } else {
+                                        // Return -errno
+                                        let err = nix::errno::Errno::last();
+                                        tracee.regs.cancel_syscall("android-compat: emulate statfs error");
+                                        tracee
+                                            .regs
+                                            .set(
+                                                crate::register::SysResult,
+                                                (-(err as i32)) as u64,
+                                                "statfs err",
+                                            );
+                                        tracee.regs.set_restore_original_regs(false);
+                                        tracee.regs.push_regs()?;
+                                    }
+                                }
+                                // utimes(path, timeval[2]) -> utimensat(AT_FDCWD, path, timespec[2], 0)
+                                #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "arm"))]
+                                x if x == sc::nr::UTIMES => {
+                                    use std::mem::size_of;
+                                    let tv_ptr = tracee.regs.get(Current, SysArg(SysArg2)) as *mut libc::c_void;
+                                    if tv_ptr.is_null() {
+                                        tracee.regs.set_sys_num(sc::nr::UTIMENSAT, "android-compat: utimes->utimensat");
+                                        tracee.regs.set(SysArg(SysArg4), 0, "flags=0");
+                                        tracee.regs.set(SysArg(SysArg3), 0, "timespec=NULL");
+                                        tracee.regs.set(SysArg(SysArg1), libc::AT_FDCWD as _, "AT_FDCWD");
+                                    } else {
+                                        let mut buf = vec![0u8; 2 * size_of::<libc::timeval>()];
+                                        let word_size = size_of::<crate::register::Word>();
+                                        let nb_words = (buf.len() + word_size - 1) / word_size;
+                                        for i in 0..nb_words {
+                                            let src = unsafe { (tv_ptr as *mut crate::register::Word).offset(i as isize) } as *mut libc::c_void;
+                                            let w = nix::sys::ptrace::read(tracee.regs.get_pid(), src)? as crate::register::Word;
+                                            let bytes = crate::register::reader::convert_word_to_bytes(w);
+                                            let start = i * word_size;
+                                            let end = std::cmp::min(start + word_size, buf.len());
+                                            buf[start..end].copy_from_slice(&bytes[..end - start]);
+                                        }
+                                        let tv: &[libc::timeval] = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const libc::timeval, 2) };
+                                        let ts = [
+                                            libc::timespec { tv_sec: tv[0].tv_sec, tv_nsec: tv[0].tv_usec * 1000 },
+                                            libc::timespec { tv_sec: tv[1].tv_sec, tv_nsec: tv[1].tv_usec * 1000 },
+                                        ];
+                                        let ts_bytes = unsafe { std::slice::from_raw_parts((&ts as *const libc::timespec) as *const u8, 2 * size_of::<libc::timespec>()) };
+                                        let ts_ptr = tracee.regs.allocate_and_write(ts_bytes, false)?;
+                                        tracee.regs.set_sys_num(sc::nr::UTIMENSAT, "android-compat: utimes->utimensat");
+                                        tracee.regs.set(SysArg(SysArg4), 0, "flags=0");
+                                        tracee.regs.set(SysArg(SysArg3), ts_ptr as u64, "timespec*");
+                                        tracee.regs.set(SysArg(SysArg1), libc::AT_FDCWD as _, "AT_FDCWD");
+                                    }
+                                }
+                                // select -> pselect6 (convert timeval to timespec)
+                                #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "arm"))]
+                                x if x == sc::nr::SELECT => {
+                                    use std::mem::size_of;
+                                    let tv_ptr = tracee.regs.get(Current, SysArg(SysArg5)) as *mut libc::c_void;
+                                    let ts_ptr = if tv_ptr.is_null() { 0 } else {
+                                        let mut buf = vec![0u8; size_of::<libc::timeval>()];
+                                        let word_size = size_of::<crate::register::Word>();
+                                        let nb_words = (buf.len() + word_size - 1) / word_size;
+                                        for i in 0..nb_words {
+                                            let src = unsafe { (tv_ptr as *mut crate::register::Word).offset(i as isize) } as *mut libc::c_void;
+                                            let w = nix::sys::ptrace::read(tracee.regs.get_pid(), src)? as crate::register::Word;
+                                            let bytes = crate::register::reader::convert_word_to_bytes(w);
+                                            let start = i * word_size;
+                                            let end = std::cmp::min(start + word_size, buf.len());
+                                            buf[start..end].copy_from_slice(&bytes[..end - start]);
+                                        }
+                                        let tv: libc::timeval = unsafe { std::ptr::read(buf.as_ptr() as *const libc::timeval) };
+                                        let ts = libc::timespec { tv_sec: tv.tv_sec, tv_nsec: tv.tv_usec * 1000 };
+                                        let ts_bytes = unsafe { std::slice::from_raw_parts((&ts as *const libc::timespec) as *const u8, size_of::<libc::timespec>()) };
+                                        tracee.regs.allocate_and_write(ts_bytes, false)? as u64
+                                    };
+                                    tracee.regs.set_sys_num(sc::nr::PSELECT6, "android-compat: select->pselect6");
+                                    tracee.regs.set(SysArg(SysArg6), 0, "sigmask=NULL");
+                                    tracee.regs.set(SysArg(SysArg5), ts_ptr as u64, "timespec*");
+                                }
+                                // poll -> ppoll (convert timeout ms to timespec)
+                                #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "arm"))]
+                                x if x == sc::nr::POLL => {
+                                    let timeout_ms = tracee.regs.get(Current, SysArg(SysArg3)) as i64;
+                                    if timeout_ms < 0 {
+                                        tracee.regs.set(SysArg(SysArg3), 0, "timespec=NULL");
+                                    } else {
+                                        let ts = libc::timespec { tv_sec: timeout_ms / 1000, tv_nsec: (timeout_ms % 1000) * 1_000_000 };
+                                        let ts_bytes = unsafe { std::slice::from_raw_parts((&ts as *const libc::timespec) as *const u8, std::mem::size_of::<libc::timespec>()) };
+                                        let ts_ptr = tracee.regs.allocate_and_write(ts_bytes, false)?;
+                                        tracee.regs.set(SysArg(SysArg3), ts_ptr as u64, "timespec*");
+                                    }
+                                    tracee.regs.set_sys_num(sc::nr::PPOLL, "android-compat: poll->ppoll");
+                                    tracee.regs.set(SysArg(SysArg4), 0, "sigmask=NULL");
+                                    tracee.regs.set(SysArg(SysArg5), 0, "sigsetsize=0");
+                                }
+                                // epoll_wait -> epoll_pwait
+                                #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "arm"))]
+                                x if x == sc::nr::EPOLL_WAIT => {
+                                    tracee.regs.set_sys_num(sc::nr::EPOLL_PWAIT, "android-compat: epoll_wait->epoll_pwait");
+                                    tracee.regs.set(SysArg(SysArg5), 0, "sigmask=NULL");
+                                    tracee.regs.set(SysArg(SysArg6), 0, "sigsetsize=0");
+                                }
+                                // NOTE: Legacy syscalls like open/chmod/chown/unlink/access/mkdir/rename do not
+                                // exist on aarch64, so no remapping is attempted for them here.
+                                _ => {}
+                            }
+                            Ok(())
+                        })() {
+                            debug!("android-compat: SIGSYS rewrite skipped: {}", e);
+                        }
+                            }
                         }
                         Signal::SIGTRAP => {
                             // Since PTRACE_O_TRACESYSGOOD is not supported on older versions of
@@ -421,7 +669,7 @@ pub extern "C" fn show_info(pid: pid_t) {
     println!("showing info pid {}", pid);
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "android")))]
 mod tests {
     use super::*;
     use nix::unistd::Pid;

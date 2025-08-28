@@ -4,6 +4,8 @@ use libc::{S_IRUSR, S_IXUSR};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::fs;
+use std::env;
 
 const LOADER_EXE: &'static [u8] = include_bytes!("loader-shim");
 
@@ -17,8 +19,21 @@ impl LoaderFile for TempFile {
         let mut file = self.create_file()?;
         let mut perms = file.metadata()?.permissions();
 
-        // copy the binary loader in this temporary file
-        file.write_all(LOADER_EXE)?;
+        // Allow overriding the embedded loader with an external binary for
+        // platforms like Android/Termux where building the loader may require
+        // special toolchains. If the environment variable PROOT_LOADER_SHIM is
+        // set and points to a readable file, we use its contents.
+        if let Ok(path) = env::var("PROOT_LOADER_SHIM") {
+            if !path.is_empty() {
+                let bytes = fs::read(&path)?;
+                file.write_all(&bytes)?;
+            } else {
+                file.write_all(LOADER_EXE)?;
+            }
+        } else {
+            // copy the binary loader in this temporary file
+            file.write_all(LOADER_EXE)?;
+        }
 
         // make it readable and executable
         perms.set_mode((S_IRUSR | S_IXUSR) as _);
@@ -32,7 +47,7 @@ impl LoaderFile for TempFile {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "android")))]
 mod tests {
     use super::*;
 

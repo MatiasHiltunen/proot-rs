@@ -8,9 +8,10 @@ use crate::register::{
     StackPointer, SysArg, SysArg1, SysArg2, SysArg3, SysArg4, SysArg5, SysArg6, SysResult,
 };
 
+#[cfg(target_os = "linux")]
 lazy_static! {
     // Generated from https://chromium.googlesource.com/chromiumos/docs/+/master/constants/syscalls.md#cross_arch-numbers
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    // On Linux we keep the full, detailed mapping using `sc::nr::*`.
     static ref SYSNUM_TO_SYSCALL_NAME: HashMap<usize, &'static str> = [
         #[cfg(any(target_arch = "arm"))]
         (sc::nr::ARM_BREAKPOINT, "ARM_breakpoint"),
@@ -836,6 +837,65 @@ lazy_static! {
         (sc::nr::WRITE, "write"),
         #[cfg(any(target_arch = "x86_64", target_arch = "arm", target_arch = "aarch64", target_arch = "x86"))]
         (sc::nr::WRITEV, "writev"),
+    ]
+    .iter()
+    .cloned()
+    .collect();
+}
+
+// On Android (Termux), expose a minimal syscall map using only numbers that
+// are available through `libc` (via our `sc` shim). This improves log
+// readability without requiring the exhaustive Linux table.
+#[cfg(target_os = "android")]
+lazy_static! {
+    static ref SYSNUM_TO_SYSCALL_NAME: HashMap<usize, &'static str> = [
+        (sc::nr::EXECVE, "execve"),
+        (sc::nr::OPENAT, "openat"),
+        (sc::nr::READ, "read"),
+        (sc::nr::READV, "readv"),
+        (sc::nr::WRITE, "write"),
+        (sc::nr::WRITEV, "writev"),
+        (sc::nr::CLOSE, "close"),
+        (sc::nr::READLINKAT, "readlinkat"),
+        (sc::nr::UNLINKAT, "unlinkat"),
+        (sc::nr::SYMLINKAT, "symlinkat"),
+        (sc::nr::LINKAT, "linkat"),
+        (sc::nr::RENAMEAT, "renameat"),
+        (sc::nr::FCHOWNAT, "fchownat"),
+        (sc::nr::FCHMODAT, "fchmodat"),
+        (sc::nr::FACCESSAT, "faccessat"),
+        (sc::nr::UTIMENSAT, "utimensat"),
+        (sc::nr::GETCWD, "getcwd"),
+        (sc::nr::CHDIR, "chdir"),
+        (sc::nr::FCHDIR, "fchdir"),
+        (sc::nr::PTRACE, "ptrace"),
+        (sc::nr::WAIT4, "wait4"),
+        (sc::nr::BRK, "brk"),
+        (sc::nr::UNAME, "uname"),
+        (sc::nr::NANOSLEEP, "nanosleep"),
+        (sc::nr::CLOCK_NANOSLEEP, "clock_nanosleep"),
+        (sc::nr::BIND, "bind"),
+        (sc::nr::CONNECT, "connect"),
+        (sc::nr::ACCEPT, "accept"),
+        (sc::nr::ACCEPT4, "accept4"),
+        (sc::nr::GETSOCKNAME, "getsockname"),
+        (sc::nr::GETPEERNAME, "getpeername"),
+        (sc::nr::MOUNT, "mount"),
+        (sc::nr::UMOUNT2, "umount2"),
+        (sc::nr::PIVOT_ROOT, "pivot_root"),
+        (sc::nr::SETXATTR, "setxattr"),
+        (sc::nr::GETXATTR, "getxattr"),
+        (sc::nr::LSETXATTR, "lsetxattr"),
+        (sc::nr::LGETXATTR, "lgetxattr"),
+        (sc::nr::REMOVEXATTR, "removexattr"),
+        (sc::nr::LISTXATTR, "listxattr"),
+        (sc::nr::LLISTXATTR, "llistxattr"),
+        (sc::nr::INOTIFY_ADD_WATCH, "inotify_add_watch"),
+        (sc::nr::SWAPON, "swapon"),
+        (sc::nr::SWAPOFF, "swapoff"),
+        (sc::nr::MKDIRAT, "mkdirat"),
+        (sc::nr::MKNODAT, "mknodat"),
+        (sc::nr::NAME_TO_HANDLE_AT, "name_to_handle_at"),
     ]
     .iter()
     .cloned()

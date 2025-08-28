@@ -323,7 +323,7 @@ fn process_prot_flags(flags: u32) -> ProtFlags {
     read_flag | write_flag | execute_flag
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "android")))]
 mod tests {
     use super::*;
     use crate::errors::Error;

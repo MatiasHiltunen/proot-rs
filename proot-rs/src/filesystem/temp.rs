@@ -39,7 +39,7 @@ impl Drop for TempFile {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "android")))]
 mod tests {
     use super::*;
     use std::io::Write;

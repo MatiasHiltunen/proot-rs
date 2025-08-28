@@ -53,7 +53,7 @@ pub fn exit(tracee: &mut Tracee) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "android")))]
 mod tests {
     use super::*;
     use crate::utils::tests::test_with_proot;

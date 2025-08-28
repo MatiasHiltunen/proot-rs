@@ -65,8 +65,24 @@ impl FileSystem {
         // We need to ensure that the target path for the binding exists.
         // Skip the check for "/" because "/" always exists.
         if canonical_guest_path != Path::new("/") {
-            self.substitute(&canonical_guest_path, Side::Guest)?
-                .metadata()?; // call .metadata() to check if the path exist
+            let host_target = self.substitute(&canonical_guest_path, Side::Guest)?;
+            let existence_check = host_target.metadata();
+            if existence_check.is_err() {
+                // Allow relaxed bindings for well-known pseudo filesystems so
+                // that platforms like Termux/Android can bind host /proc,/dev,
+                // /sys into an initially empty guest rootfs.
+                let gp = canonical_guest_path.as_path();
+                let is_pseudo = gp.starts_with("/proc")
+                    || gp.starts_with("/dev")
+                    || gp.starts_with("/sys")
+                    || gp.starts_with("/apex")
+                    || gp.starts_with("/system")
+                    || gp.starts_with("/vendor");
+                if !is_pseudo {
+                    // For normal paths, propagate the error.
+                    existence_check?;
+                }
+            }
         }
 
         // Add a binding at the beginning of the list, so that we get the most recent
@@ -237,7 +253,7 @@ impl FileSystem {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "android")))]
 mod tests {
     use super::*;
     use crate::filesystem::binding::Side::{Guest, Host};

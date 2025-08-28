@@ -1,6 +1,6 @@
 #![allow(clippy::redundant_static_lifetimes)]
 #![allow(clippy::redundant_field_names)]
-#![feature(specialization)]
+// Note: Avoid nightly-only features to support Termux/stable toolchains.
 
 extern crate clap;
 extern crate libc;

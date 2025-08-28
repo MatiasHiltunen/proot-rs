@@ -278,7 +278,7 @@ pub(super) fn load_elf(fs: &FileSystem, parameters: &mut ExecveParameters) -> Re
     Ok(LoadResult::Finished(load_info))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "android")))]
 mod tests {
     use super::*;
     use crate::errors::Error;

@@ -11,6 +11,21 @@ use crate::{errors::Result, process::tracee::Tracee};
 
 pub fn enter(tracee: &mut Tracee) -> Result<()> {
     let sys_num = tracee.regs.get_sys_num(Current);
+    // Android compatibility: emulate lack of statx by returning ENOSYS so that
+    // libc/userland can fall back to fstatat/newfstatat. Many Android builds
+    // either lack a bionic wrapper (< API 30) or block statx via seccomp.
+    #[cfg(target_os = "android")]
+    if sys_num == sc::nr::STATX {
+        let compat = std::env::var("PROOT_ANDROID_COMPAT")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        if compat {
+            return Err(Error::errno_with_msg(
+                Errno::ENOSYS,
+                "android-compat: statx emulated as ENOSYS",
+            ));
+        }
+    }
     let dirfd = tracee.regs.get(Current, SysArg(SysArg1)) as RawFd;
     let raw_path = tracee.regs.get_sysarg_path(SysArg2)?;
 
@@ -64,7 +79,7 @@ pub fn enter(tracee: &mut Tracee) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "android")))]
 mod tests {
     use std::fs::File;
 

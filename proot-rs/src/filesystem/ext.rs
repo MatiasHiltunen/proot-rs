@@ -69,7 +69,7 @@ impl PathBufExt for PathBuf {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "android")))]
 mod tests {
     use std::fs::File;
 

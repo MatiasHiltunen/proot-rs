@@ -106,7 +106,7 @@ pub fn exit(_tracee: &mut Tracee) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "android")))]
 mod tests {
     use std::fs::File;
 

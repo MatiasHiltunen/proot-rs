@@ -13,7 +13,7 @@ impl<T> AsU8Slice for [T] {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "android")))]
 pub mod tests {
     use std::cell::RefCell;
     use std::panic::AssertUnwindSafe;

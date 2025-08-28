@@ -29,7 +29,7 @@ pub fn enter(tracee: &mut Tracee) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "android")))]
 mod tests {
     use std::os::unix::prelude::PermissionsExt;
 

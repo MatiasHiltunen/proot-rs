@@ -33,6 +33,19 @@ pub fn get_args_parser() -> App<'static, 'static> {
             .default_value(DEFAULT_CWD))
         .arg(Arg::with_name("command")
             .multiple(true))
+        // Android compatibility mode: swallow SIGSYS to avoid tracee kills
+        // under Android's seccomp policies. Enabled by default on Android.
+        .arg(Arg::with_name("android-compat")
+            .long("android-compat")
+            .help("Enable Android compatibility mode (swallow SIGSYS)."))
+        .arg(Arg::with_name("no-android-compat")
+            .long("no-android-compat")
+            .conflicts_with("android-compat")
+            .help("Disable Android compatibility mode."))
+        .arg(Arg::with_name("trampoline")
+            .long("trampoline")
+            .takes_value(true)
+            .help("Absolute path to a host-resident trampoline binary to exec first (advanced)."))
 }
 
 pub fn parse_config() -> Result<(FileSystem, Vec<String>)> {
@@ -48,6 +61,26 @@ pub fn parse_config() -> Result<(FileSystem, Vec<String>)> {
     let rootfs: &str = matches.value_of("rootfs").unwrap();
     // -r *path* is equivalent to -b *path*:/
     fs.set_root(rootfs)?;
+
+    // Add sensible default binds when a rootfs is specified, so common
+    // pseudo filesystems remain visible inside the guest. This especially
+    // helps on Termux/Android where /proc access is required by many tools.
+    // These are no-ops if the paths don’t exist on the host, or if user adds
+    // explicit bindings which will take precedence by order.
+    for (host, guest) in [
+        ("/proc", "/proc"),
+        ("/dev", "/dev"),
+        ("/sys", "/sys"),
+        // Android-specific roots frequently accessed by bionic/tools
+        ("/apex", "/apex"),
+        ("/system", "/system"),
+        ("/vendor", "/vendor"),
+    ] {
+        if std::path::Path::new(host).exists() {
+            // Ignore errors here; explicit -b bindings may override later.
+            let _ = fs.add_binding(host, guest);
+        }
+    }
 
     // option(s) -b
     if let Some(bindings) = matches.values_of("bind") {
@@ -68,6 +101,20 @@ pub fn parse_config() -> Result<(FileSystem, Vec<String>)> {
         Some(values) => values.map(|s| s.into()).collect(),
         None => ["/bin/sh".into()].into(),
     };
+
+    // Configure Android compatibility behavior via environment variable used
+    // in the event loop. Default behavior: enabled on Android, disabled otherwise.
+    let want_enable = matches.is_present("android-compat");
+    let want_disable = matches.is_present("no-android-compat");
+    if want_enable {
+        std::env::set_var("PROOT_ANDROID_COMPAT", "1");
+    } else if want_disable {
+        std::env::set_var("PROOT_ANDROID_COMPAT", "0");
+    }
+
+    if let Some(path) = matches.value_of("trampoline") {
+        std::env::set_var("PROOT_TRAMPOLINE", path);
+    }
 
     Ok((fs, command))
 }

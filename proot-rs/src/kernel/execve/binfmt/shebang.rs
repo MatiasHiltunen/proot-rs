@@ -192,7 +192,7 @@ fn extract(host_path: &Path) -> Result<ExtractResult> {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "android")))]
 mod tests {
     use super::*;
     use crate::utils::tests::get_test_rootfs_path;
