@@ -180,6 +180,84 @@ This fork adds first-pass Termux/Android (aarch64) support on stable Rust:
   isn’t killed; enable/disable via `PROOT_ANDROID_COMPAT` (default: enabled on Android). This is a
   pragmatic survival mode; full emulation policies may be expanded over time.
  - CLI flags: `--android-compat` and `--no-android-compat` to toggle the behavior explicitly.
+ - When `android-compat` is enabled, selectively remaps legacy syscalls blocked by seccomp to
+   their modern counterparts with safe argument conversions (on arches where applicable):
+   - `select` → `pselect6` (convert `timeval`→`timespec`, `sigmask=NULL`).
+   - `poll` → `ppoll` (convert `timeout(ms)`→`timespec`, `sigmask=NULL`, `sigsetsize=0`).
+   - `epoll_wait` → `epoll_pwait` (`sigmask=NULL`, `sigsetsize=0`).
+   - `utimes` → `utimensat` (`timeval[2]`→`timespec[2]`, `flags=0`, `dirfd=AT_FDCWD`).
+   - `utime` → `utimensat` (`utimbuf`→`timespec[2]`, `flags=0`, `dirfd=AT_FDCWD`).
+  - `futimesat` → `utimensat` (`timeval[2]`→`timespec[2]`, `flags=0`).
+  - Note: These remaps are compiled only on architectures where the legacy syscalls exist
+     (x86/x86_64/arm). aarch64 does not expose these legacy syscalls.
+
+Remap event logging (optional):
+- Set `PROOT_ANDROID_REMAP_LOG=/path/to/log.jsonl` to capture remap events as JSON lines:
+  `{"pid":123, "from":23, "to":288, "msg":"accept->accept4"}`. Useful in tests for asserting
+  that a remap occurred without parsing textual logs.
+
+### Runtime Smoke Example
+
+- A small example program is provided to exercise remapped syscalls and produce debug logs:
+  - Path: `proot-rs/examples/remap_smoke.rs`
+  - On x86/x86_64/arm: calls `select`, `poll`, and `utimes` to trigger remaps.
+  - On Android aarch64: calls `statfs` (handled via tracer emulation).
+
+Run with debug logs enabled to observe remaps:
+
+```shell
+# Build the example binary
+cargo build --package=proot-rs --example remap_smoke
+
+# Run it under proot-rs with Android-compat mode and debug logs
+RUST_LOG=debug PROOT_ANDROID_COMPAT=1 \
+  cargo run --package=proot-rs -- -r <rootfs> -- \
+  target/debug/examples/remap_smoke
+```
+
+To exercise an `accept(2)` call (which may be remapped to `accept4(2)` under SIGSYS), use:
+
+```shell
+cargo build --package=proot-rs --example accept_smoke
+
+# Default: AF_UNIX abstract socket (robust across environments)
+RUST_LOG=debug PROOT_ANDROID_COMPAT=1 \
+  cargo run --package=proot-rs -- -r <rootfs> -- \
+  target/debug/examples/accept_smoke
+
+# Optional: TCP loopback variant
+PROOT_ENABLE_TCP_SMOKE=1 RUST_LOG=debug PROOT_ANDROID_COMPAT=1 \
+  cargo run --package=proot-rs -- -r <rootfs> -- \
+  target/debug/examples/accept_smoke
+```
+
+Newer at-family smoke (with fallbacks):
+- Attempts `faccessat2(AT_EACCESS)` and `renameat2` first; falls back to `faccessat`/`renameat` on ENOSYS.
+
+```shell
+cargo build --package=proot-rs --example at_new_smoke
+RUST_LOG=debug PROOT_ANDROID_COMPAT=1 \
+  cargo run --package=proot-rs -- -r <rootfs> -- \
+  target/debug/examples/at_new_smoke
+```
+
+Exec shebang smoke:
+- Creates a small `#!/bin/sh` script inside guest `/tmp` and execs it.
+
+```shell
+cargo build --package=proot-rs --example shebang_smoke
+RUST_LOG=debug PROOT_ANDROID_COMPAT=1 \
+  cargo run --package=proot-rs -- -r <rootfs> -- \
+  target/debug/examples/shebang_smoke
+```
+
+Android smoke runner (Termux):
+
+```shell
+# Builds examples, ensures a busybox rootfs if needed, runs bats tests
+scripts/android-smoke.sh
+```
+
 
 Notes:
 - Running end-to-end on Android typically requires ptrace to be permitted for the app; many devices
@@ -209,6 +287,13 @@ cargo test --package=proot-rs -- --test-threads=1
 > Note:
 > - Since our testing will spawn multiple processes, we need `--test-threads=1` to avoid deadlock caused by `fork()`. The option `--nocapture` may also be needed to show the original panic reason printed out by the child process.
 > - Add the option `--profile=production` if you want to test a release build of proot-rs
+
+On Android/Termux:
+- Ptrac e-heavy tests are compiled out, but Android-focused unit tests for the conversion helpers and syscall constant shims are enabled. Run:
+
+```shell
+cargo test --package=proot-rs
+```
 
 ### Integration testing
 

@@ -50,6 +50,21 @@ load helper.bash
   grep -q '"msg":"statfs emulated"' "$LOG_FILE"
 }
 
+@test "examples: accept_smoke logs accept->accept4 remap when applicable" {
+  EXE="$PROJECT_ROOT/target/debug/examples/accept_smoke"
+  if [ ! -x "$EXE" ]; then
+    skip "example binary not found: $EXE"
+  fi
+  LOG_FILE="$(mktemp)"
+  PROOT_ANDROID_REMAP_LOG="$LOG_FILE" PROOT_ANDROID_COMPAT=1 RUST_LOG=info runp proot-rs -r "$ROOTFS" -- "$EXE"
+  [ "$status" -eq 0 ]
+  if grep -q '"msg":"accept->accept4"' "$LOG_FILE"; then
+    : # success
+  else
+    skip "No accept->accept4 remap observed (device policy may allow accept)"
+  fi
+}
+
 @test "examples: shebang_smoke runs under proot" {
   EXE="$PROJECT_ROOT/target/debug/examples/shebang_smoke"
   if [ ! -x "$EXE" ]; then

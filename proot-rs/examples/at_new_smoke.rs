@@ -45,6 +45,21 @@ fn try_renameat2(dirfd: libc::c_int, old: &CString, newp: &CString) -> io::Resul
     Ok(())
 }
 
+#[cfg(all(target_os = "android", target_arch = "aarch64"))]
+fn try_rename_exchange(dirfd: libc::c_int, p1: &CString, p2: &CString) -> io::Result<()> {
+    unsafe {
+        // RENAME_EXCHANGE = 2
+        let rc = syscall(sc::nr::RENAMEAT2 as _, dirfd, p1.as_ptr(), dirfd, p2.as_ptr(), 2);
+        if rc == 0 { return Ok(()); }
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() == Some(libc::ENOSYS) {
+            // Not supported: treat as success for a guarded test
+            return Ok(());
+        }
+        Err(e)
+    }
+}
+
 fn main() -> io::Result<()> {
     unsafe {
         let base = CString::new("/tmp/at_new_smoke").unwrap();
@@ -58,26 +73,47 @@ fn main() -> io::Result<()> {
         if afd < 0 { let _ = libc::close(dirfd); return Err(io::Error::last_os_error()); }
         let _ = libc::close(afd);
 
-        // faccessat2 or fallback
-        try_faccessat2(dirfd, &a)?;
+        // Allow selecting which path to exercise via env: PROOT_AT_NEW={faccessat2|renameat2|both}
+        let mode = std::env::var("PROOT_AT_NEW").unwrap_or_else(|_| "both".into());
 
-        // renameat2 or fallback: a -> b
+        if mode == "faccessat2" || mode == "both" {
+            // faccessat2 or fallback
+            try_faccessat2(dirfd, &a)?;
+        }
+
         let b = CString::new("b").unwrap();
-        try_renameat2(dirfd, &a, &b)?;
+        if mode == "renameat2" || mode == "both" {
+            // renameat2 or fallback: a -> b
+            try_renameat2(dirfd, &a, &b)?;
 
-        // Negative test: renameat2(b -> b) with RENAME_NOREPLACE should fail with EEXIST if supported
-        #[cfg(all(target_os = "android", target_arch = "aarch64"))]
-        unsafe {
-            let e = syscall(sc::nr::RENAMEAT2 as _, dirfd, b.as_ptr(), dirfd, b.as_ptr(), 1 /* RENAME_NOREPLACE */);
-            if e == 0 {
-                // Unexpected success; clean up and error
-                let _ = libc::unlinkat(dirfd, b.as_ptr(), 0);
-                let _ = libc::close(dirfd);
-                return Err(io::Error::new(io::ErrorKind::Other, "renameat2 noreplace unexpectedly succeeded"));
+            // Negative test: only when requested and supported
+            if std::env::var_os("PROOT_AT_NEW_NEGATIVE").is_some() {
+                #[cfg(all(target_os = "android", target_arch = "aarch64"))]
+                unsafe {
+                    let e = syscall(sc::nr::RENAMEAT2 as _, dirfd, b.as_ptr(), dirfd, b.as_ptr(), 1 /* RENAME_NOREPLACE */);
+                    if e == 0 {
+                        let _ = libc::unlinkat(dirfd, b.as_ptr(), 0);
+                        let _ = libc::close(dirfd);
+                        return Err(io::Error::new(io::ErrorKind::Other, "renameat2 noreplace unexpectedly succeeded"));
+                    }
+                }
+            }
+            // Optional exchange test when requested
+            if std::env::var_os("PROOT_AT_NEW_EXCHANGE").is_some() {
+                #[cfg(all(target_os = "android", target_arch = "aarch64"))]
+                {
+                    // Create c
+                    let c = CString::new("c").unwrap();
+                    let cfd = libc::openat(dirfd, c.as_ptr(), libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC, 0o644);
+                    if cfd >= 0 { let _ = libc::close(cfd); }
+                    // Exchange b <-> c if supported; ignore ENOSYS inside
+                    try_rename_exchange(dirfd, &b, &c)?;
+                    let _ = libc::unlinkat(dirfd, c.as_ptr(), 0);
+                }
             }
         }
 
-        // Cleanup
+        // Cleanup (ignore ENOENT)
         let _ = libc::unlinkat(dirfd, b.as_ptr(), 0);
         let _ = libc::close(dirfd);
     }

@@ -382,6 +382,17 @@ impl PRoot {
                             tracee.regs.fetch_regs()?;
                             let sys = tracee.regs.get_sys_num(Current);
                             match sys {
+                                // statx: on Android-compat, report ENOSYS to drive libc fallback
+                                x if x == sc::nr::STATX => {
+                                    debug!("android-compat: emulate statx as ENOSYS");
+                                    crate::android_log::log_remap(sc::nr::STATX, sc::nr::STATX, "statx->ENOSYS", tracee.pid.as_raw());
+                                    tracee.regs.cancel_syscall("android-compat: emulate statx ENOSYS");
+                                    tracee
+                                        .regs
+                                        .set(crate::register::SysResult, (-(Errno::ENOSYS as i32)) as u64, "statx ENOSYS");
+                                    tracee.regs.set_restore_original_regs(false);
+                                    tracee.regs.push_regs()?;
+                                }
                                 // epoll_create(size) -> epoll_create1(flags=0)
                                 #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "arm"))]
                                 x if x == sc::nr::EPOLL_CREATE => {
@@ -517,6 +528,41 @@ impl PRoot {
                                         tracee.regs.set(SysArg(SysArg1), libc::AT_FDCWD as _, "AT_FDCWD");
                                     }
                                 }
+                                // futimesat(dirfd, path, timeval[2]) -> utimensat(dirfd, path, timespec[2], 0)
+                                #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "arm"))]
+                                x if x == sc::nr::FUTIMESAT => {
+                                    debug!("android-compat: remap futimesat -> utimensat");
+                                    crate::android_log::log_remap(sc::nr::FUTIMESAT, sc::nr::UTIMENSAT, "futimesat->utimensat", tracee.pid.as_raw());
+                                    use std::mem::size_of;
+                                    let tv_ptr = tracee.regs.get(Current, SysArg(SysArg3)) as *mut libc::c_void;
+                                    if tv_ptr.is_null() {
+                                        tracee.regs.set_sys_num(sc::nr::UTIMENSAT, "android-compat: futimesat->utimensat");
+                                        tracee.regs.set(SysArg(SysArg4), 0, "flags=0");
+                                        tracee.regs.set(SysArg(SysArg3), 0, "timespec=NULL");
+                                    } else {
+                                        let mut buf = vec![0u8; 2 * size_of::<libc::timeval>()];
+                                        let word_size = size_of::<crate::register::Word>();
+                                        let nb_words = (buf.len() + word_size - 1) / word_size;
+                                        for i in 0..nb_words {
+                                            let src = unsafe { (tv_ptr as *mut crate::register::Word).offset(i as isize) } as *mut libc::c_void;
+                                            let w = nix::sys::ptrace::read(tracee.regs.get_pid(), src)? as crate::register::Word;
+                                            let bytes = crate::register::reader::convert_word_to_bytes(w);
+                                            let start = i * word_size;
+                                            let end = std::cmp::min(start + word_size, buf.len());
+                                            buf[start..end].copy_from_slice(&bytes[..end - start]);
+                                        }
+                                        let tv: &[libc::timeval] = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const libc::timeval, 2) };
+                                        let ts = [
+                                            libc::timespec { tv_sec: tv[0].tv_sec, tv_nsec: tv[0].tv_usec * 1000 },
+                                            libc::timespec { tv_sec: tv[1].tv_sec, tv_nsec: tv[1].tv_usec * 1000 },
+                                        ];
+                                        let ts_bytes = unsafe { std::slice::from_raw_parts((&ts as *const libc::timespec) as *const u8, 2 * size_of::<libc::timespec>()) };
+                                        let ts_ptr = tracee.regs.allocate_and_write(ts_bytes, false)?;
+                                        tracee.regs.set_sys_num(sc::nr::UTIMENSAT, "android-compat: futimesat->utimensat");
+                                        tracee.regs.set(SysArg(SysArg4), 0, "flags=0");
+                                        tracee.regs.set(SysArg(SysArg3), ts_ptr as u64, "timespec*");
+                                    }
+                                }
                                 // select -> pselect6 (convert timeval to timespec)
                                 #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "arm"))]
                                 x if x == sc::nr::SELECT => {
@@ -542,6 +588,34 @@ impl PRoot {
                                         tracee.regs.allocate_and_write(ts_bytes, false)? as u64
                                     };
                                     tracee.regs.set_sys_num(sc::nr::PSELECT6, "android-compat: select->pselect6");
+                                    tracee.regs.set(SysArg(SysArg6), 0, "sigmask=NULL");
+                                    tracee.regs.set(SysArg(SysArg5), ts_ptr as u64, "timespec*");
+                                }
+                                // _newselect -> pselect6 (same as select)
+                                #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "arm"))]
+                                x if x == sc::nr::NEWSELECT => {
+                                    debug!("android-compat: remap _newselect -> pselect6");
+                                    crate::android_log::log_remap(sc::nr::NEWSELECT, sc::nr::PSELECT6, "_newselect->pselect6", tracee.pid.as_raw());
+                                    use std::mem::size_of;
+                                    let tv_ptr = tracee.regs.get(Current, SysArg(SysArg5)) as *mut libc::c_void;
+                                    let ts_ptr = if tv_ptr.is_null() { 0 } else {
+                                        let mut buf = vec![0u8; size_of::<libc::timeval>()];
+                                        let word_size = size_of::<crate::register::Word>();
+                                        let nb_words = (buf.len() + word_size - 1) / word_size;
+                                        for i in 0..nb_words {
+                                            let src = unsafe { (tv_ptr as *mut crate::register::Word).offset(i as isize) } as *mut libc::c_void;
+                                            let w = nix::sys::ptrace::read(tracee.regs.get_pid(), src)? as crate::register::Word;
+                                            let bytes = crate::register::reader::convert_word_to_bytes(w);
+                                            let start = i * word_size;
+                                            let end = std::cmp::min(start + word_size, buf.len());
+                                            buf[start..end].copy_from_slice(&bytes[..end - start]);
+                                        }
+                                        let tv: libc::timeval = unsafe { std::ptr::read(buf.as_ptr() as *const libc::timeval) };
+                                        let ts = libc::timespec { tv_sec: tv.tv_sec, tv_nsec: tv.tv_usec * 1000 };
+                                        let ts_bytes = unsafe { std::slice::from_raw_parts((&ts as *const libc::timespec) as *const u8, size_of::<libc::timespec>()) };
+                                        tracee.regs.allocate_and_write(ts_bytes, false)? as u64
+                                    };
+                                    tracee.regs.set_sys_num(sc::nr::PSELECT6, "android-compat: _newselect->pselect6");
                                     tracee.regs.set(SysArg(SysArg6), 0, "sigmask=NULL");
                                     tracee.regs.set(SysArg(SysArg5), ts_ptr as u64, "timespec*");
                                 }

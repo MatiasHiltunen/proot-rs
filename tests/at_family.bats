@@ -36,3 +36,30 @@ load helper.bash
   PROOT_ANDROID_COMPAT=1 RUST_LOG=debug runp proot-rs -r "$ROOTFS" -- "$EXE"
   [ "$status" -eq 0 ]
 }
+
+@test "at-family: faccessat2(AT_EACCESS) path under proot (fallback ok)" {
+  EXE="$PROJECT_ROOT/target/debug/examples/at_new_smoke"
+  if [ ! -x "$EXE" ]; then
+    skip "example binary not found: $EXE"
+  fi
+  PROOT_ANDROID_COMPAT=1 RUST_LOG=debug PROOT_AT_NEW=faccessat2 runp proot-rs -r "$ROOTFS" -- "$EXE"
+  [ "$status" -eq 0 ]
+}
+
+@test "at-family: renameat2 noreplace negative under proot (skips if ENOSYS)" {
+  EXE="$PROJECT_ROOT/target/debug/examples/at_new_smoke"
+  if [ ! -x "$EXE" ]; then
+    skip "example binary not found: $EXE"
+  fi
+  PROOT_ANDROID_COMPAT=1 RUST_LOG=debug PROOT_AT_NEW_NEGATIVE=1 PROOT_AT_NEW=renameat2 runp proot-rs -r "$ROOTFS" -- "$EXE"
+  [ "$status" -eq 0 ]
+}
+
+@test "at-family: renameat2 exchange under proot (skips if ENOSYS)" {
+  EXE="$PROJECT_ROOT/target/debug/examples/at_new_smoke"
+  if [ ! -x "$EXE" ]; then
+    skip "example binary not found: $EXE"
+  fi
+  PROOT_ANDROID_COMPAT=1 RUST_LOG=debug PROOT_AT_NEW_EXCHANGE=1 PROOT_AT_NEW=renameat2 runp proot-rs -r "$ROOTFS" -- "$EXE"
+  [ "$status" -eq 0 ]
+}

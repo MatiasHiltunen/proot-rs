@@ -2,20 +2,23 @@ Android/Termux Syscalls TODO (Prioritized)
 
 Legend: [P1] highest priority, [P2] medium, [P3] lower; [T] needs unit/integration tests
 
-Remap/Compat Survival (SIGSYS fixes)
-- [P1][T] epoll_create → epoll_create1 (flags=0) (done)
-- [P1][T] utime → utimensat (utimbuf→timespec[2], flags=0, AT_FDCWD) (done)
-- [P1][T] select → pselect6 (done)
-- [P1][T] poll → ppoll (done)
-- [P1][T] epoll_wait → epoll_pwait (done)
-- [P1][T] utimes → utimensat (done)
-- [P1][T] statfs emulation (done)
-- [P1][T] statx → ENOSYS fallback (done); optional minimal emulation later
+- Remap/Compat Survival (SIGSYS fixes)
+  - [P1][T] epoll_create → epoll_create1 (flags=0) (done)
+  - [P1][T] utime → utimensat (utimbuf→timespec[2], flags=0, AT_FDCWD) (done)
+  - [P1][T] select → pselect6 (done)
+  - [P1][T] poll → ppoll (done)
+  - [P1][T] epoll_wait → epoll_pwait (done)
+  - [P1][T] utimes → utimensat (done)
+  - [P1][T] statfs emulation (done)
+  - [P1][T] statx → ENOSYS fallback (done); optional minimal emulation later
 
 Path/at-family correctness
-- [P1][T] openat, newfstatat, readlinkat, unlinkat, linkat, symlinkat, renameat, renameat2
-- [P1][T] faccessat, faccessat2
+- [P1][T] openat, newfstatat, readlinkat, unlinkat, linkat, symlinkat, renameat, renameat2 (core handlers present; examples added)
+- [P1][T] faccessat, faccessat2 (examples added; tests to guard AT_EACCESS and ENOSYS fallback)
 - [P1][T] fchmodat, fchownat
+- [P1][T] Add guarded tests:
+  - faccessat2 with `AT_EACCESS` (fallback to faccessat on ENOSYS)
+  - renameat2 with `RENAME_NOREPLACE` (skip on ENOSYS)
 
 Exec/Loader
 - [P1][T] Trampoline-first exec hardening (shebang/interpreter resolution)
@@ -54,6 +57,6 @@ Misc
 
 Testing Plan
 - Android-friendly unit tests: pure conversions (timeval/utimbuf/ms→timespec), syscall number availability.
-- Examples: exercise remapped syscalls (select/poll/utimes/accept/statfs), AF_UNIX preferred.
+- Examples: exercise remapped syscalls (select/poll/utimes/accept/statfs), AF_UNIX preferred; at-family (core/edges/new).
 - Bats integration: run examples under proot with android-compat enabled.
-- Optional: remap event sink (JSON log) to assert remaps happened.
+- Remap event sink (JSON log) to assert remaps happened (done for core remaps and statfs emulation).
