@@ -15,6 +15,24 @@ pub fn enter(tracee: &mut Tracee) -> Result<()> {
     let deref_final = !(flags.contains(OFlag::O_NOFOLLOW)
         || (flags.contains(OFlag::O_EXCL) && flags.contains(OFlag::O_CREAT)));
 
+    // Android/Termux passthrough for absolute host paths (see open.rs for rationale)
+    #[cfg(target_os = "android")]
+    {
+        use std::borrow::Cow;
+        let s: Cow<str> = raw_path.to_string_lossy();
+        let mut allow_passthrough = false;
+        if s.starts_with("/system/") || s.starts_with("/vendor/") || s.starts_with("/apex/") || s.starts_with("/proc/") || s.starts_with("/dev/") {
+            allow_passthrough = true;
+        } else if let Ok(prefix) = std::env::var("PREFIX") {
+            if s.starts_with(&prefix) || s.starts_with("/data/") || s.starts_with("/mnt/") {
+                allow_passthrough = true;
+            }
+        }
+        if allow_passthrough {
+            return Ok(());
+        }
+    }
+
     let host_path = tracee.translate_path_at(dirfd, raw_path, deref_final)?.1;
 
     tracee.regs.set_sysarg_path(

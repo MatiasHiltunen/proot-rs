@@ -5,6 +5,14 @@ members = [
   "proot-rs",
   "loader-shim",
 ]
+default-members = [
+  # Build and test the main crate by default. The `loader-shim` requires
+  # an older Nightly toolchain and low-level flags that are not available
+  # on Termux’s stable Rust. Keeping it out of default members ensures
+  # `cargo build`/`cargo test` works on Android/Termux while preserving
+  # the ability to build `loader-shim` explicitly on supported hosts.
+  "proot-rs",
+]
 
 [profile.release]
 strip = true

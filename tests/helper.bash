@@ -36,14 +36,32 @@ function proot-rs() {
 function compile_c_static() {
     local target_path="$1"
     local source_path="$2"
-    gcc -static -o "$target_path" "$source_path"
+
+    # Ensure compiler exists
+    command -v gcc 1>&- 2>&- || { skip "gcc is required for this test."; }
+
+    # Some environments (e.g., Termux/Android) do not support static linking.
+    # Probe static linking with a tiny program. If it fails, skip gracefully.
+    local probe_src
+    probe_src="$(mktemp)" || probe_src="/tmp/bats_probe_static_$$.c"
+    cat > "$probe_src" <<'EOF'
+int main(){return 0;}
+EOF
+    if ! gcc -static -o /dev/null "$probe_src" 2>/dev/null; then
+        rm -f "$probe_src"
+        skip "Static linking not supported on this platform."
+    fi
+    rm -f "$probe_src"
+
+    gcc -std=gnu89 -static -o "$target_path" "$source_path"
 }
 
 # Same as `compile_c_static()`, but the final binary is dynamically linked
 function compile_c_dynamic() {
     local target_path="$1"
     local source_path="$2"
-    gcc -o "$target_path" "$source_path"
+    command -v gcc 1>&- 2>&- || { skip "gcc is required for this test."; }
+    gcc -std=gnu89 -o "$target_path" "$source_path"
 }
 
 # Ensure that the command exists, or skip the test

@@ -10,6 +10,5 @@ pub mod validation;
 
 pub use self::canonicalization::Canonicalizer;
 pub use self::fs::FileSystem;
-pub use self::readers::ExtraReader;
 pub use self::substitution::Substitutor;
 pub use self::translation::Translator;

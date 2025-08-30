@@ -257,11 +257,11 @@ impl LoadInfo {
         }
 
         self.elf_header.apply_mut(
-            |mut header32| {
+            |header32| {
                 header32.e_entry += load_base as u32;
                 Ok(())
             },
-            |mut header64| {
+            |header64| {
                 header64.e_entry += load_base as u64;
                 Ok(())
             },

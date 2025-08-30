@@ -2,12 +2,14 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::errors::*;
+use std::os::unix::ffi::OsStrExt;
 use crate::kernel::execve::binfmt;
 use crate::kernel::execve::loader::LoaderFile;
 use crate::kernel::execve::params::{self, ExecveParameters};
 use crate::process::tracee::Tracee;
 use crate::register::PtraceWriter;
 use crate::register::{Current, PtraceReader, SysArg, SysArg1, SysArg2};
+use crate::register::SysArgIndex::SysArg3;
 
 pub fn translate(tracee: &mut Tracee, loader: &dyn LoaderFile) -> Result<()> {
     //TODO: implement this part for ptrace translation
@@ -21,10 +23,33 @@ pub fn translate(tracee: &mut Tracee, loader: &dyn LoaderFile) -> Result<()> {
     //		return 0;
     //	}
 
-    // Read required values from tracee
-    let raw_guest_path = tracee.regs.get_sysarg_path(SysArg1)?;
-    let argv_addr = tracee.regs.get(Current, SysArg(SysArg2));
+    // Read required values from tracee (support EXECVE and EXECVEAT)
+    let sysnum = tracee.regs.get_sys_num(Current);
+    let (path_arg, argv_arg) = if sysnum == sc::nr::EXECVEAT {
+        // execveat(dirfd, pathname, argv, envp, flags)
+        (SysArg(SysArg2), SysArg(SysArg3))
+    } else {
+        // execve(filename, argv, envp)
+        (SysArg(SysArg1), SysArg(SysArg2))
+    };
+
+    let raw_guest_path = tracee.regs.get_sysarg_path(match path_arg { SysArg(i) => i, _ => unreachable!() })?;
+    let argv_addr = tracee.regs.get(Current, argv_arg);
     let argv = params::read_argv(tracee.pid, argv_addr as _)?;
+
+    // Android/Termux compatibility: If the tracee is intentionally invoking the
+    // system linker as a trampoline (e.g., `/system/bin/linker64 /data/.../sh`),
+    // then skip injecting our loader shim and allow the exec to proceed
+    // untouched. This is necessary to let the first exec succeed under app-data
+    // execute restrictions on Android.
+    #[cfg(target_os = "android")]
+    {
+        use std::borrow::Cow;
+        let s: Cow<str> = raw_guest_path.to_string_lossy();
+        if s.starts_with("/system/bin/linker") {
+            return Ok(());
+        }
+    }
 
     //TODO: implement runner for qemu
     //	if (tracee->qemu != NULL) {
@@ -40,7 +65,11 @@ pub fn translate(tracee: &mut Tracee, loader: &dyn LoaderFile) -> Result<()> {
         argv: argv,
     };
 
-    // Try to parse and load this executable
+    debug!("execve.enter: raw_guest_path={:?}", raw_guest_path);
+    // Android: proceed with loader injection (same flow as non-Android), except
+    // when the system linker is being invoked explicitly (handled above).
+
+    // Try to parse and load this executable (non-Android flow)
     let load_info = binfmt::load(&tracee.fs.borrow(), &mut parameters)
         .with_context(|| format!("failed to load file {:?}", raw_guest_path))?;
 

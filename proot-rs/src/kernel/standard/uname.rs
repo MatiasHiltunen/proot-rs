@@ -1,4 +1,3 @@
-use crate::errors::*;
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub fn exit() -> Result<()> {

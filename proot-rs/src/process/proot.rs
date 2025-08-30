@@ -20,6 +20,8 @@ use crate::{
     filesystem::{temp::TempFile, FileSystem},
 };
 use crate::filesystem::Translator;
+use crate::filesystem::canonicalization::Canonicalizer;
+use crate::filesystem::substitution::Substitutor;
 
 /// Used to store global info common to all tracees. Rename into
 /// `Configuration`?
@@ -210,42 +212,168 @@ impl PRoot {
                     // script that re-execs the intended command. This ensures the first exec
                     // succeeds on Android/Termux and our ptrace translation can take over on the
                     // subsequent exec.
-                    // Allow explicit trampoline path via env (CLI flag). Otherwise try common shells.
-                    let mut trampoline = std::env::var_os("PROOT_TRAMPOLINE")
-                        .map(std::path::PathBuf::from)
-                        .unwrap_or_else(|| initial_fs.get_root().join("bin/sh"));
-                    if !trampoline.exists() {
-                        trampoline = initial_fs.get_root().join("bin/dash");
-                    }
-                    if !trampoline.exists() {
-                        trampoline = std::path::PathBuf::from("/system/bin/sh");
-                    }
+                    //
+                    // Resolve the trampoline by treating paths inside the guest rootfs correctly
+                    // even when they are absolute symlinks (e.g. /bin/sh -> /bin/busybox inside
+                    // Alpine). We canonicalize the guest path using the FileSystem, then translate
+                    // it back to a host path for exec.
+                    let mut tramp_host: Option<std::path::PathBuf> = None;
 
-                    let tramp_bytes = trampoline.as_os_str().as_bytes();
-                    let tramp = std::ffi::CString::new(tramp_bytes)
-                        .with_context(|| format!("No suitable shell found for trampoline at {:?}", trampoline))?;
-
-                    // Build argv for: sh -c 'exec "$@"' -- <original argv>
-                    let dash_c = std::ffi::CString::new("-c").unwrap();
-                    let script = std::ffi::CString::new("exec \"$@\"").unwrap();
-                    let sep = std::ffi::CString::new("--").unwrap();
-
-                    // Compose: [tramp, -c, script, --, orig0, orig1, ...]
-                    let mut new_argv: Vec<std::ffi::CString> = Vec::with_capacity(4 + args.len());
-                    new_argv.push(tramp.clone());
-                    new_argv.push(dash_c);
-                    new_argv.push(script);
-                    new_argv.push(sep);
-                    for a in &args {
-                        new_argv.push(a.clone());
+                    // 1) Respect explicit override via env/CLI.
+                    if let Some(os) = std::env::var_os("PROOT_TRAMPOLINE") {
+                        let p = std::path::PathBuf::from(os);
+                        if p.exists() {
+                            tramp_host = Some(p);
+                        }
                     }
 
-                    let argv_refs: Vec<&std::ffi::CStr> = new_argv.iter().map(|c| c.as_c_str()).collect();
-                    unistd::execv(&tramp, &argv_refs).with_context(|| {
-                        format!(
-                            "Failed to call execv() trampoline {:?} for command: {:?}",
-                            trampoline, command
-                        )
+                    // 2) Prefer known host shells in Termux/Android. Using a guest binary like
+                    // /bin/sh (busybox) will fail at the first exec because the kernel resolves
+                    // the ELF interpreter against the host root. A host-resident shell avoids that.
+                    if tramp_host.is_none() {
+                        let prefix = std::env::var_os("PREFIX").map(std::path::PathBuf::from);
+                        if let Some(p) = prefix {
+                            for name in ["sh", "dash", "bash"].iter() {
+                                let c = p.join("bin").join(name);
+                                if c.symlink_metadata().is_ok() {
+                                    debug!("android-compat: using termux shell {:?}", c);
+                                    tramp_host = Some(c);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    // 3) Build final trampoline exec. On Android/Termux, prefer using the system
+                    // linker to exec the Termux shell to bypass app-data execute restrictions.
+                    // Fallback to direct shell exec if needed.
+                    let mut trampoline = tramp_host.unwrap_or_else(|| std::path::PathBuf::from("/system/bin/sh"));
+                    let mut argv_vec: Vec<std::ffi::CString> = Vec::new();
+
+                    #[cfg(target_os = "android")]
+                    {
+                        // Helper: best-effort translate an absolute guest path to a host path.
+                        let translate_guest_abs = |arg0: &std::ffi::CString| -> Option<std::path::PathBuf> {
+                            let a0b = arg0.as_bytes();
+                            if !a0b.starts_with(b"/") { return None; }
+                            let guest = std::ffi::OsStr::from_bytes(a0b);
+                            // Try canonicalize + substitute first.
+                            if let Ok(guest_canon) = initial_fs.canonicalize(guest, true) {
+                                if let Ok(host_path) = initial_fs.substitute(&guest_canon, crate::filesystem::binding::Side::Guest) {
+                                    return Some(host_path);
+                                }
+                            }
+                            // Fallback: root + stripped guest
+                            let gp = std::path::Path::new(guest);
+                            if gp.is_absolute() {
+                                let mut host = initial_fs.get_root().to_path_buf();
+                                if let Ok(stripped) = gp.strip_prefix("/") { host.push(stripped); }
+                                // Resolve symlinks within the guest root to avoid absolute guest
+                                // symlinks escaping to host root at exec time.
+                                let mut seen = 0u8;
+                                loop {
+                                    if seen > 8 { break; }
+                                    seen += 1;
+                                    match host.symlink_metadata() {
+                                        Ok(meta) if meta.file_type().is_symlink() => {
+                                            match host.read_link() {
+                                                Ok(link) => {
+                                                    if link.is_absolute() {
+                                                        let mut new_host = initial_fs.get_root().to_path_buf();
+                                                        if let Ok(stripped) = link.strip_prefix("/") { new_host.push(stripped); } else { new_host.push(link); }
+                                                        host = new_host;
+                                                    } else {
+                                                        // relative to the symlink's directory
+                                                        if let Some(parent) = host.parent() {
+                                                            host = parent.join(link);
+                                                        } else {
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                                Err(_) => break,
+                                            }
+                                        }
+                                        _ => break,
+                                    }
+                                }
+                                return Some(host);
+                            }
+                            None
+                        };
+                        // Try system linker first
+                        let linker_candidates = [
+                            std::path::Path::new("/system/bin/linker64"),
+                            std::path::Path::new("/system/bin/linker"),
+                        ];
+                        let mut found_linker: Option<&std::path::Path> = None;
+                        for l in linker_candidates.iter() {
+                            if l.exists() {
+                                found_linker = Some(l);
+                                break;
+                            }
+                        }
+                        if let Some(linker) = found_linker {
+                            // Always prefer system linker when available to bypass app-data exec restriction.
+                            debug!("android-compat: using system linker {:?} to exec {:?}", linker, trampoline);
+                            std::env::set_var("TERMUX_EXEC__SYSTEM_LINKER_EXEC__MODE", "force");
+
+                            let linker_c = std::ffi::CString::new(linker.as_os_str().as_bytes()).unwrap();
+                            argv_vec.push(linker_c);
+                            // Prepare translated program path for the linker
+                            let translated_prog = translate_guest_abs(&args[0]);
+                            // Always use shell trampoline for the actual target to avoid the
+                            // linker trying to open guest files directly.
+                            debug!("android-compat: using shell -c exec trampoline for target");
+                            let sh_c = std::ffi::CString::new(trampoline.as_os_str().as_bytes()).unwrap();
+                            argv_vec.push(sh_c);
+                            argv_vec.push(std::ffi::CString::new("-c").unwrap());
+                            argv_vec.push(std::ffi::CString::new("exec \"$@\"").unwrap());
+                            // name for $0
+                            argv_vec.push(std::ffi::CString::new("sh").unwrap());
+                            // translated best-effort target and remaining args
+                            if let Some(tp2) = translate_guest_abs(&args[0]) {
+                                argv_vec.push(std::ffi::CString::new(tp2.as_os_str().as_bytes()).unwrap());
+                            } else {
+                                argv_vec.push(args[0].clone());
+                            }
+                            for a in args.iter().skip(1) { argv_vec.push(a.clone()); }
+
+                            let argv_refs: Vec<&std::ffi::CStr> = argv_vec.iter().map(|c| c.as_c_str()).collect();
+                            unistd::execv(&std::ffi::CString::new(linker.as_os_str().as_bytes()).unwrap(), &argv_refs).with_context(|| {
+                                format!("Failed to call system linker {:?} for command: {:?}", linker, command)
+                            })?;
+                            unreachable!();
+                        }
+                    }
+
+                    // Non-Android or fallback: exec the target program directly (no shell).
+                    // Translate argv[0] to a host path if it's an absolute guest path, otherwise
+                    // use it as-is and let PATH resolution happen.
+                    let mut argv_translated: Vec<std::ffi::CString> = Vec::with_capacity(args.len());
+                    if let Some(first) = args.get(0) {
+                        let a0b = first.as_bytes();
+                        debug!("fallback: pre-translate argv[0]={:?}", std::str::from_utf8(a0b).unwrap_or("<bin>"));
+                        if a0b.starts_with(b"/") {
+                            let guest = std::ffi::OsStr::from_bytes(a0b);
+                            if let Ok(guest_canon) = initial_fs.canonicalize(guest, true) {
+                                if let Ok(host_path) = initial_fs.substitute(&guest_canon, crate::filesystem::binding::Side::Guest) {
+                                    if let Ok(c) = std::ffi::CString::new(host_path.as_os_str().as_bytes()) {
+                                        argv_translated.push(c);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if argv_translated.is_empty() {
+                        argv_translated.push(args[0].clone());
+                    }
+                    let prog = argv_translated.remove(0);
+                    let mut final_argv: Vec<&std::ffi::CStr> = Vec::with_capacity(1 + args.len());
+                    final_argv.push(prog.as_c_str());
+                    for a in args.iter().skip(1) { final_argv.push(a.as_c_str()); }
+                    unistd::execv(&prog, &final_argv).with_context(|| {
+                        format!("Failed to exec target {:?} for command: {:?}", prog, command)
                     })?;
                     unreachable!()
                 };
@@ -378,7 +506,7 @@ impl PRoot {
                         // Opportunistically rewrite some blocked syscalls to their
                         // *at/*p* replacements so the kernel permits them under seccomp.
                         if let Err(e) = (|| -> Result<()> {
-                            use crate::register::{Current, SysArg, SysArg1, SysArg2, SysArg3, SysArg4, SysArg5, PtraceReader, PtraceWriter};
+                            use crate::register::{Current, SysArg, SysArg1, SysArg2, SysArg4, PtraceReader, PtraceWriter};
                             tracee.regs.fetch_regs()?;
                             let sys = tracee.regs.get_sys_num(Current);
                             match sys {

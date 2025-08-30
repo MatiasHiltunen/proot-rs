@@ -46,7 +46,7 @@ pub enum SyscallGroup {
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn syscall_group_from_sysnum(sysnum: usize) -> SyscallGroup {
     match sysnum {
-        sc::nr::EXECVE => SyscallGroup::Execve,
+        sc::nr::EXECVE | sc::nr::EXECVEAT => SyscallGroup::Execve,
         sc::nr::PTRACE => SyscallGroup::Ptrace,
         sc::nr::WAIT4 => SyscallGroup::Wait,
         #[cfg(any(target_arch = "x86"))]

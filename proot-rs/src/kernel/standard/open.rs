@@ -10,6 +10,28 @@ use crate::register::{Current, PtraceReader, SysArg, SysArg1, SysArg2};
 pub fn enter(tracee: &mut Tracee) -> Result<()> {
     let raw_path = tracee.regs.get_sysarg_path(SysArg1)?;
 
+    // Android/Termux: Allow certain absolute host paths to pass through without
+    // guest->host translation. This is primarily to support the initial
+    // trampoline phase where the system linker opens Termux binaries under
+    // app data (e.g., $PREFIX/bin/sh). Translating those would incorrectly map
+    // them under the guest rootfs and cause ENOENT.
+    #[cfg(target_os = "android")]
+    {
+        use std::borrow::Cow;
+        let s: Cow<str> = raw_path.to_string_lossy();
+        let mut allow_passthrough = false;
+        if s.starts_with("/system/") || s.starts_with("/vendor/") || s.starts_with("/apex/") || s.starts_with("/proc/") || s.starts_with("/dev/") {
+            allow_passthrough = true;
+        } else if let Ok(prefix) = std::env::var("PREFIX") {
+            if s.starts_with(&prefix) || s.starts_with("/data/") || s.starts_with("/mnt/") {
+                allow_passthrough = true;
+            }
+        }
+        if allow_passthrough {
+            return Ok(());
+        }
+    }
+
     let flags = OFlag::from_bits_truncate(tracee.regs.get(Current, SysArg(SysArg2)) as _);
 
     let deref_final = !(flags.contains(OFlag::O_NOFOLLOW)

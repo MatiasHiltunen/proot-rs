@@ -20,7 +20,7 @@ pub fn convert_bytes_to_word(value_to_convert: [u8; 4]) -> Word {
 #[cfg(target_pointer_width = "64")]
 #[inline]
 pub fn convert_bytes_to_word(value_to_convert: [u8; 8]) -> Word {
-    unsafe { mem::transmute(value_to_convert) }
+    unsafe { u64::from_ne_bytes(value_to_convert) }
 }
 
 pub trait PtraceWriter {

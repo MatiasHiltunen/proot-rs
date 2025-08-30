@@ -15,7 +15,7 @@ pub fn convert_word_to_bytes(value_to_convert: Word) -> [u8; 4] {
 #[cfg(target_pointer_width = "64")]
 #[inline]
 pub fn convert_word_to_bytes(value_to_convert: Word) -> [u8; 8] {
-    unsafe { transmute(value_to_convert) }
+    unsafe { u64::to_ne_bytes(value_to_convert) }
 }
 
 pub trait PtraceReader {

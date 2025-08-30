@@ -33,6 +33,12 @@ pub fn translate(tracee: &mut Tracee) -> Result<()> {
     // New processes have no heap.
     //bzero(tracee->heap, sizeof(Heap));
 
+    // If enter stage did not prepare load_info (e.g., Android trampoline via
+    // system linker), there is nothing to transfer; skip quietly.
+    if tracee.load_info.is_none() {
+        return Ok(());
+    }
+
     let res = transfert_load_script(tracee);
     tracee.load_info = None;
     res
@@ -43,13 +49,22 @@ pub fn transfert_load_script(tracee: &mut Tracee) -> Result<()> {
     let stack_pointer = tracee.regs.get(Current, StackPointer) as usize;
 
     let load_info = tracee.load_info.as_ref().unwrap();
-    // collect strings
-    let string1_bytes = load_info.user_path.as_ref().unwrap().as_os_str().as_bytes();
-    let string1_size = string1_bytes.len() + 1;
-    let string2_bytes = load_info
-        .interp
+    // collect strings: open host paths (not guest paths)
+    let string1_bytes = load_info
+        .host_path
         .as_ref()
-        .map(|interp| interp.user_path.as_ref().unwrap().as_os_str().as_bytes());
+        .unwrap()
+        .as_os_str()
+        .as_bytes();
+    let string1_size = string1_bytes.len() + 1;
+    let string2_bytes = load_info.interp.as_ref().map(|interp| {
+        interp
+            .host_path
+            .as_ref()
+            .unwrap()
+            .as_os_str()
+            .as_bytes()
+    });
     let string2_size = string2_bytes.map_or(0, |s| s.len() + 1);
     let string3_bytes = if load_info.user_path == load_info.raw_path {
         None
@@ -153,9 +168,13 @@ pub fn transfert_load_script(tracee: &mut Tracee) -> Result<()> {
 
     // determine the entry_point of this executable
     let entry_point = if let Some(interp) = load_info.interp.as_ref() {
-        get!(interp.elf_header, e_entry, libc::c_ulong)?
+        let ep = get!(interp.elf_header, e_entry, libc::c_ulong)?;
+        debug!("execve.exit: using interpreter entry: 0x{:x}", ep);
+        ep
     } else {
-        get!(load_info.elf_header, e_entry, libc::c_ulong)?
+        let ep = get!(load_info.elf_header, e_entry, libc::c_ulong)?;
+        debug!("execve.exit: using program entry: 0x{:x}", ep);
+        ep
     };
 
     // Load script statement: start.
